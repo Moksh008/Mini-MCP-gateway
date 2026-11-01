@@ -1,0 +1,34 @@
+# Overlay for an internet-facing PUBLIC DEMO. Layer it on top of the base config:
+#   mcp-gateway serve -c examples/gateway.yaml -c deploy/demo.overlay.yaml
+#
+# The demo API keys in the base config are published on purpose. Everything below makes
+# that safe: shared keys are rate-limited per client IP, runtime changes are bounded and
+# expire, the registry resets itself, upstream registration can only target the demo
+# backends, visitors' IPs are hidden, and the LLM agent has hard daily budgets.
+
+upstream_host_allowlist: [backends, 127.0.0.1]   # SSRF: runtime servers may only point at the demo stack
+allow_stdio_registration: false
+metrics_public: false
+
+demo:
+  enabled: true
+  reset_interval_s: 1800        # restore the registry to this config every 30 min
+  runtime_server_ttl_s: 600     # servers added through the console expire after 10 min
+  max_runtime_servers: 3
+  hide_client_ips: true
+
+limits:
+  per_client_ip: true           # everyone shares the demo keys, so limit per IP, not per key
+  default_request_rate: { per_minute: 240, burst: 60 }
+  default_tool_call_rate: { per_minute: 60, burst: 20 }
+  max_argument_bytes: 16384
+
+agent:
+  enabled: true                 # needs OPENROUTER_API_KEY in the environment
+  model: anthropic/claude-haiku-5.5
+  allowed_models: [anthropic/claude-haiku-5.5]   # keep the public demo on the cheap model
+  max_steps: 8
+  max_tokens: 800
+  run_rate: { per_minute: 3, burst: 3 }          # per client IP
+  daily_run_budget: 400
+  daily_token_budget: 4000000   # ≈ $0.40/day input at Haiku 5.5 prices; hard stop after that

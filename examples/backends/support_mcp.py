@@ -42,4 +42,9 @@ def escalate_ticket(ticket_id: str, reason: str) -> dict:
     return _tickets[ticket_id]
 
 
+def reset() -> None:
+    """Clear in-memory state (public demo resets)."""
+    _tickets.clear()
+
+
 app = mcp.streamable_http_app()

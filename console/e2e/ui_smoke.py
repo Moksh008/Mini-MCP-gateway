@@ -20,6 +20,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:3000")
     ap.add_argument("--shots", default=None, help="directory to write screenshots to")
+    ap.add_argument("--insecure", action="store_true", help="accept self-signed TLS (local Caddy)")
     ap.add_argument("--channel", default=None, help="browser channel, e.g. msedge or chrome (default: bundled chromium)")
     args = ap.parse_args()
     shots = Path(args.shots) if args.shots else None
@@ -36,7 +37,8 @@ def main() -> int:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(channel=args.channel) if args.channel else p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1600, "height": 1000}, device_scale_factor=1)
+        page = browser.new_page(viewport={"width": 1600, "height": 1000}, device_scale_factor=1,
+                                ignore_https_errors=args.insecure)
         def on_console(m) -> None:
             # The Auth scenario deliberately sends bad keys; browsers log those 401s on their own.
             if m.type == "error" and "status of 401" not in m.text:
@@ -44,6 +46,14 @@ def main() -> int:
 
         page.on("console", on_console)
         page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+
+        # 0. Security headers on both the SPA and proxied API routes (regression: nginx add_header inheritance)
+        for path in ("/", "/readyz"):
+            headers = page.request.get(f"{args.url}{path}").headers
+            for h in ("content-security-policy", "x-frame-options", "x-content-type-options"):
+                if h not in headers:
+                    errors.append(f"missing {h} on {path}")
+        print("ok  security headers present on / and /readyz")
 
         # 1. Playground: incremental search → schema → call
         page.goto(f"{args.url}/#/playground")
@@ -69,6 +79,11 @@ def main() -> int:
         page.wait_for_timeout(800)
         assert "payments__refund_payment" not in page.locator(".hits").inner_text(), "refund leaked to rider"
         print("ok  playground: rider cannot discover refunds")
+
+        # 1b. AI Agent page renders (enabled or with setup instructions)
+        page.goto(f"{args.url}/#/agent")
+        expect(page.get_by_role("heading", name="AI Agent")).to_be_visible()
+        print("ok  agent page renders")
 
         # 2. Operator sign-in
         page.goto(f"{args.url}/#/overview")

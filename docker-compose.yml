@@ -36,6 +36,7 @@ services:
       PAYMENTS_URL: http://backends:9104
       MAPS_URL: http://backends:9105
       PAYMENTS_API_TOKEN: ${PAYMENTS_API_TOKEN:-dev-payments-token}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}   # enables the AI Agent page (put it in ./.env)
       FORWARDED_ALLOW_IPS: "*"        # trust X-Forwarded-For from the console proxy (private network)
     volumes:
       - gateway-var:/app/var          # registry.db + audit.jsonl survive restarts

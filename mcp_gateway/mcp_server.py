@@ -124,6 +124,40 @@ def _decode_cursor(cursor: str | None) -> int:
         return 0
 
 
+async def dispatch_search_mode(
+    gateway: Gateway, c: CallContext, name: str, arguments: dict[str, Any],
+) -> types.CallToolResult:
+    """Execute one meta-tool (or a direct call by qualified name). Raises ``GatewayError``.
+
+    Shared by the ``/mcp`` endpoint and the built-in LLM agent, so both follow one code path.
+    """
+    if name == "search_tools":
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise InvalidArguments("'query' must be a non-empty string")
+        try:
+            limit = int(arguments.get("limit", 5) or 5)
+        except (TypeError, ValueError):
+            raise InvalidArguments("'limit' must be an integer") from None
+        results = gateway.search(c, query, limit)
+        return _json_result({"results": results, "hint": "Use get_tool_schema before call_tool."})
+    if name == "get_tool_schema":
+        names = arguments.get("names")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+            raise InvalidArguments("'names' must be a non-empty array of strings")
+        return _json_result(gateway.describe(c, names))
+    if name == "call_tool":
+        target = arguments.get("name")
+        if not isinstance(target, str):
+            raise InvalidArguments("'name' must be a string")
+        args = arguments.get("arguments") or {}
+        if not isinstance(args, dict):
+            raise InvalidArguments("'arguments' must be an object")
+        return await gateway.call(c, target, args)
+    # direct call by qualified name (lets clients pin hot tools without a search)
+    return await gateway.call(c, name, arguments)
+
+
 def build_mcp_server(gateway: Gateway, mode: str) -> Server:
     assert mode in ("full", "search")
     server = _GatewayServer(
@@ -160,30 +194,10 @@ def build_mcp_server(gateway: Gateway, mode: str) -> Server:
 
     @server.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        c = ctx()
         try:
             if mode == "search":
-                if name == "search_tools":
-                    query = arguments.get("query")
-                    if not isinstance(query, str) or not query.strip():
-                        raise InvalidArguments("'query' must be a non-empty string")
-                    results = gateway.search(c, query, int(arguments.get("limit", 5) or 5))
-                    return _json_result({"results": results, "hint": "Use get_tool_schema before call_tool."})
-                if name == "get_tool_schema":
-                    names = arguments.get("names")
-                    if not isinstance(names, list) or not all(isinstance(n, str) for n in names) or not names:
-                        raise InvalidArguments("'names' must be a non-empty array of strings")
-                    return _json_result(gateway.describe(c, names))
-                if name == "call_tool":
-                    target = arguments.get("name")
-                    if not isinstance(target, str):
-                        raise InvalidArguments("'name' must be a string")
-                    args = arguments.get("arguments") or {}
-                    if not isinstance(args, dict):
-                        raise InvalidArguments("'arguments' must be an object")
-                    return await gateway.call(c, target, args)
-            # full mode, or a direct call by qualified name in search mode
-            return await gateway.call(c, name, arguments)
+                return await dispatch_search_mode(gateway, ctx(), name, arguments)
+            return await gateway.call(ctx(), name, arguments)
         except GatewayError as e:
             return error_result(e)
 

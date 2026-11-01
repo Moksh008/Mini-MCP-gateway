@@ -1,0 +1,14 @@
+# Automatic HTTPS (Let's Encrypt) for the public demo. Caddy replaces any client-supplied
+# X-Forwarded-For with the real client IP, which nginx and the gateway then trust.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy console:8080
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	log {
+		output stdout
+		format console
+	}
+}

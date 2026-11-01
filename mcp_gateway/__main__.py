@@ -15,7 +15,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     serve = sub.add_parser("serve", help="run the gateway")
-    serve.add_argument("--config", "-c", help="path to gateway YAML (default: $MCPGW_CONFIG)")
+    serve.add_argument("--config", "-c", action="append",
+                       help="gateway YAML; repeat to layer overlays (default: $MCPGW_CONFIG, comma-separated)")
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
     serve.add_argument("--log-level", default="info")
@@ -23,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gen-key", help="generate an API key and its SHA-256 for the config")
 
     check = sub.add_parser("check-config", help="validate a config file and exit")
-    check.add_argument("--config", "-c", required=True)
+    check.add_argument("--config", "-c", action="append", required=True)
 
     args = parser.parse_args(argv)
 

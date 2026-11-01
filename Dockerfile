@@ -11,6 +11,7 @@ RUN pip install .
 
 # Example backends + config are included so the image can run the demo out of the box.
 COPY examples ./examples
+COPY deploy/demo.overlay.yaml ./deploy/demo.overlay.yaml
 
 RUN useradd --system --uid 10001 gateway && mkdir -p /app/var && chown gateway /app/var
 USER gateway

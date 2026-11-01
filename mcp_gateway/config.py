@@ -108,6 +108,52 @@ class LimitsSpec(BaseModel):
     max_result_bytes: int = 256 * 1024
     max_argument_bytes: int = 64 * 1024
     search_max_results: int = 20
+    # Key rate limits by principal *and* client IP. Essential when credentials are shared,
+    # e.g. a public demo where everyone uses the same demo keys.
+    per_client_ip: bool = False
+
+
+class DemoSpec(BaseModel):
+    """Public-sandbox mode: safe to expose on the internet with published demo keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # Periodically restore the registry to the config file (drop runtime servers, re-enable all).
+    reset_interval_s: float = Field(default=1800.0, ge=60)
+    # Runtime-registered servers expire after this long, and at most this many may exist.
+    runtime_server_ttl_s: float = Field(default=900.0, ge=30)
+    max_runtime_servers: int = Field(default=3, ge=0)
+    # Do not reveal other visitors' IP addresses through the audit API.
+    hide_client_ips: bool = True
+
+
+class AgentSpec(BaseModel):
+    """Server-side LLM agent that uses the gateway as its only tool source.
+
+    Speaks the OpenAI-compatible chat-completions protocol (OpenRouter by default). The API
+    key is read from the environment and never sent to the browser. Budgets protect the
+    key's owner from abuse when the demo is public.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True  # effective only when the API key env var is set
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
+    model: str = "anthropic/claude-haiku-5.5"
+    allowed_models: list[str] = Field(default_factory=lambda: [
+        "anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5",
+    ])
+    max_steps: int = Field(default=8, ge=1, le=25)
+    max_tokens: int = Field(default=1024, ge=64, le=8192)
+    timeout_s: float = Field(default=60.0, gt=0, le=300)
+    max_tool_result_chars: int = Field(default=4000, ge=200)
+    run_rate: RateLimitSpec = RateLimitSpec(per_minute=4, burst=3)
+    daily_run_budget: int = Field(default=500, ge=1)
+    daily_token_budget: int = Field(default=3_000_000, ge=1000)
+    app_url: str = "https://github.com/Moksh008/mini-mcp-gateway"
+    app_name: str = "Mini MCP Gateway"
 
 
 class CircuitBreakerSpec(BaseModel):
@@ -137,6 +183,8 @@ class GatewayConfig(BaseModel):
     audit: AuditSpec = AuditSpec()
     limits: LimitsSpec = LimitsSpec()
     circuit_breaker: CircuitBreakerSpec = CircuitBreakerSpec()
+    demo: DemoSpec = DemoSpec()
+    agent: AgentSpec = AgentSpec()
 
     def model_post_init(self, _: Any) -> None:
         names = [s.name for s in self.servers]
@@ -152,31 +200,51 @@ class GatewayConfig(BaseModel):
             raise ConfigError("duplicate api key ids")
 
 
-def load_config(path: str | os.PathLike[str] | None = None) -> GatewayConfig:
-    """Load config from ``path`` (or ``$MCPGW_CONFIG``), applying ``MCPGW_HOST``/``MCPGW_PORT``."""
-    path = path or os.environ.get("MCPGW_CONFIG")
+def _read_file(p: Path) -> dict[str, Any]:
+    if not p.exists():
+        raise ConfigError(f"config file not found: {p}")
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{p}: top level must be a mapping")
+    # Relative paths (stdio cwd, db, audit log) resolve against *this* file's directory.
+    base = p.resolve().parent
+    for server in data.get("servers", []) or []:
+        # Endpoint URLs may use ${VAR:-default} so one file works across environments.
+        # (Header values are deliberately expanded later, at connect time.)
+        for key in ("url", "openapi_url"):
+            if isinstance(server.get(key), str):
+                server[key] = expand_env(server[key])
+        if server.get("cwd") and not Path(server["cwd"]).is_absolute():
+            server["cwd"] = str((base / server["cwd"]).resolve())
+    if data.get("registry_db") and not Path(data["registry_db"]).is_absolute():
+        data["registry_db"] = str((base / data["registry_db"]).resolve())
+    audit = data.get("audit") or {}
+    if audit.get("path") and not Path(audit["path"]).is_absolute():
+        audit["path"] = str((base / audit["path"]).resolve())
+    return data
+
+
+def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge mappings; lists and scalars in ``overlay`` replace those in ``base``."""
+    out = dict(base)
+    for k, v in overlay.items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def load_config(paths: str | os.PathLike[str] | list | None = None) -> GatewayConfig:
+    """Load one or more YAML files (later files overlay earlier ones), then env overrides.
+
+    ``paths`` may be a path, a list of paths, or None to use ``$MCPGW_CONFIG`` (comma-separated).
+    """
+    if paths is None:
+        env = os.environ.get("MCPGW_CONFIG", "")
+        paths = [x.strip() for x in env.split(",") if x.strip()]
+    elif not isinstance(paths, list):
+        paths = [paths]
     data: dict[str, Any] = {}
-    if path:
-        p = Path(path)
-        if not p.exists():
-            raise ConfigError(f"config file not found: {p}")
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        # Relative paths (stdio cwd, db, audit log) resolve against the config file's directory.
-        base = p.resolve().parent
-        for server in data.get("servers", []) or []:
-            # Endpoint URLs may use ${VAR:-default} so one file works across environments.
-            # (Header values are deliberately expanded later, at connect time.)
-            for key in ("url", "openapi_url"):
-                if isinstance(server.get(key), str):
-                    server[key] = expand_env(server[key])
-            if server.get("cwd") and not Path(server["cwd"]).is_absolute():
-                server["cwd"] = str((base / server["cwd"]).resolve())
-        for key in ("registry_db",):
-            if data.get(key) and not Path(data[key]).is_absolute():
-                data[key] = str((base / data[key]).resolve())
-        audit = data.get("audit") or {}
-        if audit.get("path") and not Path(audit["path"]).is_absolute():
-            audit["path"] = str((base / audit["path"]).resolve())
+    for path in paths:
+        data = deep_merge(data, _read_file(Path(path)))
     if os.environ.get("MCPGW_HOST"):
         data["host"] = os.environ["MCPGW_HOST"]
     if os.environ.get("MCPGW_PORT"):

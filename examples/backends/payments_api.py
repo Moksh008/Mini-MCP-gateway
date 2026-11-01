@@ -79,6 +79,11 @@ def invoice(charge_id: str):
             "line_items": [{"description": ch["description"] or "Charge", "amount_usd": ch["amount_usd"]}]}
 
 
+def reset() -> None:
+    """Clear in-memory state (public demo resets)."""
+    _charges.clear()
+
+
 @app.get("/internal/reconcile", operation_id="reconcile", openapi_extra={"x-mcp-exclude": True},
          dependencies=[Depends(require_token)])
 def reconcile():

@@ -70,6 +70,7 @@ class ServerState:
     tools: list[ToolRecord] = field(default_factory=list)
     last_refresh: float | None = None
     refresh_error: str | None = None
+    created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +86,7 @@ class ServerState:
             "circuit": self.breaker.state,
             "tool_count": len(self.tools),
             "last_refresh_unix": self.last_refresh,
+            "created_unix": self.created_at,
             "url": self.spec.url,
         }
 
@@ -224,6 +226,34 @@ class Registry:
                 state.last_refresh = time.time()
                 self._rebuild()
         return state
+
+    def runtime_servers(self) -> list[ServerState]:
+        return [s for s in self._servers.values() if s.source == "api"]
+
+    async def reset_to_config(self, *, actor: str) -> list[str]:
+        """Drop every runtime-registered server and re-enable config servers (demo reset)."""
+        removed = []
+        for state in self.runtime_servers():
+            with contextlib.suppress(KeyError):
+                await self.deregister(state.spec.name, actor=actor)
+                removed.append(state.spec.name)
+        async with self._lock:
+            for state in self._servers.values():
+                state.breaker.record_success()
+                if not state.spec.enabled:
+                    state.spec = state.spec.model_copy(update={"enabled": True})
+            self._rebuild()
+        return removed
+
+    async def expire_runtime_servers(self, ttl_s: float, *, actor: str) -> list[str]:
+        cutoff = time.time() - ttl_s
+        expired = []
+        for state in self.runtime_servers():
+            if state.created_at < cutoff:
+                with contextlib.suppress(KeyError):
+                    await self.deregister(state.spec.name, actor=actor)
+                    expired.append(state.spec.name)
+        return expired
 
     async def refresh_all(self) -> None:
         await asyncio.gather(*(self.refresh(n) for n in list(self._servers)), return_exceptions=True)

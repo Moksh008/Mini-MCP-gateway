@@ -28,11 +28,25 @@ def make_servers(host: str = os.environ.get("BACKENDS_HOST", "127.0.0.1")) -> li
     ]
 
 
+async def reset_loop(interval_s: float) -> None:
+    """Public demo: periodically wipe the mock backends' in-memory data."""
+    from examples.backends import payments_api, rides_mcp, support_mcp
+
+    while True:
+        await asyncio.sleep(interval_s)
+        for module in (rides_mcp, support_mcp, payments_api):
+            module.reset()
+        print("demo reset: cleared backend state", flush=True)
+
+
 async def main() -> None:
     servers = make_servers()
     for name, (_, port) in BACKENDS.items():
         print(f"  {name:<9} http://127.0.0.1:{port}")
-    await asyncio.gather(*(s.serve() for s in servers))
+    tasks = [s.serve() for s in servers]
+    if os.environ.get("DEMO_RESET_S"):
+        tasks.append(reset_loop(float(os.environ["DEMO_RESET_S"])))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

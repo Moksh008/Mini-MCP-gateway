@@ -1,277 +1,155 @@
+<div align="center">
+
 # Mini MCP Gateway
 
-A small, working version of a **central MCP gateway**. It sits between AI agents and an
-organisation's tools. It is inspired by the problem Uber describes in
-[*Designing MCP Gateway: Uber's MCP Management Platform*](https://www.uber.com/blog/): hundreds of teams were
-building MCP integrations on their own, so tools were hard to discover, secure and maintain.
+**One secure front door between AI agents and an organisation's tools — with a registry, RBAC, rate limits,
+audit logs, and search-based tool discovery that keeps context cost flat as the catalog grows.**
 
-One gateway gives every agent a single endpoint. Behind it:
+[![CI](https://github.com/Moksh008/mini-mcp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Moksh008/mini-mcp-gateway/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%2B-3776ab)
+![TypeScript](https://img.shields.io/badge/console-React%20%2B%20TypeScript-3178c6)
+![MCP](https://img.shields.io/badge/protocol-MCP-2ee59d)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-* a **central registry** of upstream servers: native MCP servers over HTTP or stdio, plus existing REST services
-  bridged automatically from OpenAPI or from declared operations
-* **authentication** (API keys), **RBAC** over namespaced tools, and **rate limiting** per caller and per tool
-* **audit logs** and Prometheus **metrics**
-* **incremental tool discovery**: agents search the catalog instead of loading every tool definition into context
+<!-- Live demo: replace with your deployed URL once it's up (see docs/DEPLOY.md) -->
+**[Live demo](#try-it)** · [Architecture](docs/ARCHITECTURE.md) · [Experiment](experiments/results.md) · [Deploy](docs/DEPLOY.md)
 
+![Demo: an AI agent completing a task through the gateway](docs/demo.gif)
+
+</div>
+
+## The problem
+
+Uber's engineering team described it in [*Designing MCP Gateway*](https://www.uber.com/blog/): once hundreds of teams
+build MCP integrations independently, tools become hard to **discover**, **secure** and **maintain** — and giving an
+agent thousands of tool definitions blows up its context window. Their answer was a central gateway (800+ servers,
+5,000+ tools). This project is a compact, working, tested version of that idea that you can run with one command.
+
+## What it does
+
+```mermaid
+flowchart LR
+    subgraph clients [Clients]
+        A[AI agents<br/>Claude Code, SDKs]
+        C[Web console]
+        R[REST clients]
+    end
+    subgraph gw [Mini MCP Gateway]
+        direction TB
+        AU[Auth · hashed API keys] --> RL[Rate limits<br/>caller · tool · IP]
+        RL --> PO[RBAC<br/>deny wins · read-only roles]
+        PO --> DI{Discovery}
+        DI -- "/mcp" --> S[search_tools → get_tool_schema → call_tool]
+        DI -- "/mcp/full" --> F[classic tools/list]
+        S --> V[Schema validation]
+        F --> V
+        V --> CB[Circuit breaker<br/>+ concurrency caps]
+        REG[(Registry<br/>+ BM25 index)] -.-> DI
+        AG[LLM agent<br/>OpenRouter] --> S
+    end
+    subgraph up [Existing backends]
+        U1[rides · MCP/HTTP]
+        U2[support · MCP/HTTP]
+        U3[eats · MCP/stdio]
+        U4[payments · REST via OpenAPI]
+        U5[maps · legacy REST]
+    end
+    clients --> AU
+    CB --> U1 & U2 & U3 & U4 & U5
 ```
-                          ┌──────────────────────────── Mini MCP Gateway ───────────────────────────┐
-  Agents / MCP clients    │  AuthN ─► rate limit ─► RBAC ─► schema validation ─► circuit breaker      │   Upstreams
- ───────────────────────► │                                                                         │ ─► rides    (MCP, HTTP)
-  /mcp       incremental  │  ┌───────────┐   ┌──────────────┐   ┌───────────────────────────────┐   │ ─► support  (MCP, HTTP)
-  /mcp/full  full catalog │  │ Registry  │──►│ Tool catalog │──►│ Search index (BM25, per-caller│   │ ─► eats     (MCP, stdio)
-  /v1/*      plain REST   │  │ (SQLite)  │   │ server__tool │   │ permission-filtered)          │   │ ─► payments (REST, OpenAPI)
-  /admin/*   operators    │  └───────────┘   └──────────────┘   └───────────────────────────────┘   │ ─► maps     (REST, declared)
-                          │  Audit log (JSONL + ring buffer)  ·  /metrics (Prometheus)  ·  /readyz    │
-                          └─────────────────────────────────────────────────────────────────────────┘
-```
 
-## Run the whole stack (one machine, one command)
+* **Central registry** — native MCP servers (HTTP or stdio) and **existing REST services bridged with zero code**
+  from their OpenAPI spec or a few lines of config. Register, refresh, enable/disable at runtime.
+* **Security** — hashed API keys, glob RBAC with deny-wins and read-only roles, per-caller/per-tool rate limits,
+  schema validation before anything reaches a backend, upstream credentials injected server-side, SSRF guard.
+* **Incremental discovery** — agents get 3 small meta-tools and *search* the catalog instead of loading every
+  definition. Search is filtered per caller, so agents can't even learn that forbidden tools exist.
+* **Operability** — redacted audit log, Prometheus metrics, health/readiness, circuit breakers, a web console.
+* **A real AI agent** — an LLM completes tasks using only the gateway, as a chosen identity, with live provider
+  token counts so you can compare discovery modes.
+
+## Results
+
+Measured on the live gateway (20 tools, 5 upstreams). [Full methodology →](experiments/results.md)
+
+| | Full catalog | Incremental (search) |
+|---|---:|---:|
+| Tool tokens sent on **every** model request | 1,740 | **225 (−87%)** |
+| 10 agent tasks, end to end | 40,020 | **31,028 (−22%)** |
+| …at 5,000 tools | 749,596 / request | **225 / request** |
+| Search finds the right tool (recall@5, with 5,000 look-alike distractors) | — | **100%** |
+
+The honest trade-off: at 20 tools, multi-tool tasks cost *more* with incremental discovery (+6% to +29%) because each
+new tool needs a search and a schema fetch. The win grows with the catalog — at Uber's scale full discovery doesn't
+fit in any context window, while incremental stays constant. Pinning hot tools (direct calls on `/mcp`) covers the rest.
+
+## Try it
 
 ```bash
+git clone https://github.com/Moksh008/mini-mcp-gateway.git && cd mini-mcp-gateway
+echo "OPENROUTER_API_KEY=sk-or-..." > .env      # optional: enables the AI Agent page
 docker compose up --build -d --wait
 ```
 
-| | URL |
-|---|---|
-| **Web console** (operator dashboard + agent playground) | http://localhost:3000 |
-| MCP endpoint for agents: incremental / full | http://localhost:8787/mcp · http://localhost:8787/mcp/full |
-
-Three containers on one Docker network: `backends` (4 mock HTTP services), `gateway` (it also spawns the stdio
-`eats` server inside its container) and `console` (nginx serving the React app and reverse-proxying the gateway on
-the same origin). Health checks gate startup order, and the registry DB and audit log persist in a named volume.
-`docker compose down` stops everything; add `-v` to wipe that state.
-
-### The console
-
-![Agent Playground](docs/screenshots/playground.png)
-
-Everything in the console is backed by real gateway calls. Nothing is mocked in the browser.
-
-| Page | What it shows |
-|---|---|
-| **Agent Playground** | Act as any of the 4 demo principals. Search → fetch schema → call, in incremental or full mode. A form is generated from each tool's JSON Schema. The **wire inspector** shows every MCP JSON-RPC request and response, with its request ID. A context meter shows how many tokens each mode makes the model carry, measured from the real responses. |
-| **Scenarios** | One-click live acceptance tests: RBAC, per-caller discovery, per-tool rate limiting, schema validation, the circuit breaker on a dead upstream, and authentication. Each step is checked and marked PASS or FAIL. |
-| **Overview** | Upstream health, catalog size, traffic by outcome, most-called tools, p50/p95 latency per upstream. |
-| **Registry** | Register (from templates or raw JSON), refresh, enable/disable and remove upstream servers at runtime. |
-| **Tool catalog** | The merged, namespaced catalog with schemas and annotations. |
-| **Access policy** | The live principal × tool permission matrix, with the reason for each decision. |
-| **Audit log** | A live tail with filters. It also shows the internal denial reason that callers never see. |
-| **Token experiment** | The full vs incremental discovery results, as charts. |
-
-<details><summary>More screenshots</summary>
-
-![Overview](docs/screenshots/overview.png)
-![Scenarios](docs/screenshots/scenarios.png)
-![Access policy](docs/screenshots/policy.png)
-![Experiment](docs/screenshots/experiment.png)
-![Registry](docs/screenshots/registry.png)
-![Audit](docs/screenshots/audit.png)
-
-</details>
-
-Operator pages need an admin key (the sign-in screen offers the demo one). The key is held in that browser tab's
-`sessionStorage` only. nginx sends a strict CSP plus `X-Frame-Options`, `nosniff` and `Referrer-Policy`.
-
-## How this maps to the brief
-
-| Requirement | Where |
-|---|---|
-| Central MCP server registry | `mcp_gateway/registry.py`, `store.py`: config-declared and runtime-registered servers (persisted in SQLite), health, refresh, enable/disable, `tools/list_changed` handling |
-| Connect multiple backend APIs | `upstreams/`: MCP over Streamable HTTP and stdio, **OpenAPI → MCP** bridge, declarative REST bridge, in-process tools |
-| Discover tools dynamically | Catalog rebuilt on registration, refresh, upstream change notifications and a periodic refresh |
-| Authentication and permissions | `auth.py` (hashed API keys), `policy.py` (glob allow/deny, deny wins, read-only roles, admin) |
-| Rate limiting and audit logs | `ratelimit.py` (token buckets: per request, per caller, per tool), `audit.py` (redacted, fingerprinted JSONL) |
-| Discovery without loading every tool | `/mcp` exposes 3 meta-tools: `search_tools` → `get_tool_schema` → `call_tool` (`mcp_server.py`, `search.py`) |
-| Experiment: 20 tools, full vs incremental | `experiments/token_usage.py` → [`experiments/results.md`](experiments/results.md) |
-
-## Experiment results (20 live tools)
-
-Tokens counted with tiktoken `o200k_base` (a proxy; see the [full report](experiments/results.md)).
-
-| | Full discovery | Incremental discovery |
-|---|---:|---:|
-| Tool-definition tokens on **every** model request | **1,740** | **225** (−87%) |
-| 10 realistic agent tasks, total definition + discovery tokens | 40,020 | 31,028 (−22%) |
-| Single-tool tasks | 3,480 each | 1,806–2,356 (−32% to −48%) |
-| Multi-tool tasks (2–3 tools) | 5,220–6,960 | 5,551–8,959 (**+6% to +29%**) |
-| Search recall@5 on the 14 task queries | n/a | 100% |
-
-As the catalog grows (synthetic distractors, half of which reuse the real tools' vocabulary):
-
-| Catalog size | Full: tokens per request | Incremental: tokens per request | Recall@1 | Recall@5 |
-|---:|---:|---:|---:|---:|
-| 20 | 1,740 | 225 | 100% | 100% |
-| 500 | 73,865 | 225 | 92% | 100% |
-| 5,000 | 749,596 | 225 | 92% | 100% |
-
-**What this means.** At 20 tools, incremental discovery already cuts the fixed per-request cost by 87%. Tasks that
-need several tools can cost *more*, because each new tool needs two discovery round-trips and the whole
-catalog is still small. Full discovery grows linearly with the catalog: at the ~5,000 tools Uber reports, the
-definitions alone would fill well over any current context window, while incremental stays constant. The cost
-you pay instead is search quality and extra round-trips. That is why search returns 5 candidates and why
-`/mcp` also accepts direct calls by qualified name, so hot tools can be pinned.
-
-## Local development (without Docker)
-
-Requires Python ≥ 3.11 (and Node ≥ 20 for the console).
+Open **http://localhost:3000**. Agents connect to `http://localhost:8787/mcp`:
 
 ```bash
-pip install -e ".[dev]"
-
-# terminal 1: four mock HTTP backends (rides, support, payments, maps)
-python -m examples.run_backends
-
-# terminal 2: the gateway (it also spawns the stdio "eats" backend)
-python -m mcp_gateway serve -c examples/gateway.yaml      # http://127.0.0.1:8787
-
-# terminal 3
-python -m examples.client_demo                            # MCP client: full vs incremental flow
-python -m experiments.token_usage                         # regenerate experiments/results.md
-pytest -q                                                 # 58 tests (unit + live end-to-end)
+claude mcp add --transport http mini-gateway http://localhost:8787/mcp --header "Authorization: Bearer demo-rider-key"
 ```
 
-Console in dev mode (proxies to the local gateway on :8787):
-
-```bash
-cd console && npm install && npm run dev                  # http://localhost:5173
-```
-
-Demo API keys (plaintext `demo-<who>-key`, **demo only**):
-
-| Key | Principal | Role | Can do |
-|---|---|---|---|
-| `demo-admin-key` | ops-admin | admin | everything + `/admin` |
-| `demo-rider-key` | rider-bot | rider-agent | rides, maps, eats, pay/invoice, open tickets. **Not** refunds. Charges limited to 5/min |
-| `demo-support-key` | care-copilot | support-agent | support, payments incl. refunds, ride/order lookups |
-| `demo-analyst-key` | bi-analyst | analyst | every tool annotated read-only, no writes |
-
-### Connect an MCP client
-
-```bash
-# Claude Code
-claude mcp add --transport http mini-gateway http://127.0.0.1:8787/mcp \
-  --header "Authorization: Bearer demo-rider-key"
-```
-
-Any Streamable-HTTP MCP client works. Use `/mcp` for incremental discovery or `/mcp/full` for the classic full list.
-
-### Plain HTTP
-
-```bash
-H="Authorization: Bearer demo-rider-key"
-curl -H "$H" "localhost:8787/v1/tools/search?q=how+much+does+a+ride+cost"
-curl -H "$H" localhost:8787/v1/tools/rides__estimate_fare
-curl -H "$H" -H "content-type: application/json" -X POST localhost:8787/v1/tools/maps__geocode/call \
-     -d '{"address":"sfo airport"}'
-```
-
-## Endpoints
-
-| Path | Auth | Purpose |
+| Demo key | Acts as | Can |
 |---|---|---|
-| `POST /mcp` | key | MCP, **incremental** discovery (`search_tools`, `get_tool_schema`, `call_tool`) |
-| `POST /mcp/full` | key | MCP, every permitted tool in `tools/list` (paginated) |
-| `GET /v1/whoami`, `/v1/tools`, `/v1/tools/search?q=`, `/v1/tools/{name}` | key | REST discovery |
-| `POST /v1/tools/{name}/call` | key | REST invocation (same policy, limits and audit as MCP) |
-| `GET/POST /admin/servers`, `GET/DELETE /admin/servers/{name}` | admin | Registry: list, register (`?replace=true`), deregister |
-| `POST /admin/servers/{name}/refresh\|enable\|disable` | admin | Registry operations |
-| `GET /admin/tools?q=&server=` | admin | Full catalog view |
-| `GET /admin/audit?principal=&event=&tool=&outcome=` | admin | Recent audit events |
-| `GET /admin/stats` | admin | JSON metrics snapshot (calls by outcome, latency p50/p95, discovery, limits) |
-| `GET /admin/policy/matrix` | admin | Effective permission of every configured principal × tool, with reasons |
-| `GET /healthz`, `/readyz`, `/metrics` | none* | Liveness, readiness (+ unhealthy upstreams), Prometheus |
+| `demo-rider-key` | rider assistant | rides, maps, food, pay, open tickets — **not** refunds; charges limited to 5/min |
+| `demo-support-key` | care copilot | support, payments incl. refunds, ride/order lookups |
+| `demo-analyst-key` | BI analyst | read-only tools only |
+| `demo-admin-key` | operator | everything + admin API |
 
-\* `/metrics` requires admin when `metrics_public: false`.
+## The console
 
-Every response carries `X-Request-ID`. A valid incoming one is propagated; otherwise the gateway generates one. The same ID
-appears in the audit log and in the tool result `_meta`.
+| | |
+|---|---|
+| ![Agent Playground](docs/screenshots/playground.png) | ![Scenarios](docs/screenshots/scenarios.png) |
+| **Agent Playground** — search → schema → call as any identity, with a wire inspector showing every MCP JSON-RPC message and a live context-cost meter. | **Scenarios** — one-click live acceptance tests: RBAC, discovery isolation, rate limiting, validation, circuit breaker, auth. |
+| ![Overview](docs/screenshots/overview.png) | ![Policy](docs/screenshots/policy.png) |
+| **Overview** — upstream health, traffic by outcome, latency. | **Access policy** — the live principal × tool matrix with reasons. |
 
-## Design notes
+Also: **AI Agent** (watch an LLM work through the gateway, compare modes with real token counts), **Registry**,
+**Tool catalog**, **Audit log** (live tail incl. internal denial reasons), **Token experiment**.
 
-**Namespacing.** Tools are exposed as `<server>__<tool>`, sanitised to `^[a-zA-Z0-9_-]{1,64}$`, the strictest
-common provider constraint. Two teams can both ship a `search` tool without colliding.
+## Engineering highlights
 
-**Call pipeline** (`core.py`): resolve → authorize → rate-limit (caller, then caller+tool) → JSON-Schema validate
-→ circuit breaker + per-upstream concurrency cap → invoke with timeout → bound result size → metrics + audit.
-Invalid calls never reach the upstream.
+* **One code path for agents and clients.** The built-in LLM agent dispatches through the same function as the
+  `/mcp` endpoint, so RBAC, limits, validation and audit can't diverge.
+* **No existence oracle.** Unknown and forbidden tools return identical errors; the audit log keeps the real reason.
+* **Public-demo mode** makes publishing the demo keys safe: per-IP limits with non-spoofable client IPs, self-resetting
+  registry, expiring runtime servers, SSRF allowlist, hidden visitor IPs, and hard daily LLM budgets.
+  [Threat table →](docs/ARCHITECTURE.md#public-demo-mode)
+* **Bugs caught by testing, not users:** nginx silently dropping security headers (`add_header` inheritance),
+  unbounded metric labels from unknown tool names, IPv6 loopback misclassified as "reserved" by the SSRF guard —
+  each now has a regression test.
+* **Tested at three layers:** 76 Python tests (unit + live end-to-end with the official MCP client), strict TS build,
+  and a headless-browser suite that drives the real UI against the Docker stack in CI.
 
-**Security model.**
-* API keys are stored only as SHA-256 digests and compared in constant time. `mcp-gateway gen-key` mints them.
-* Unknown tools and forbidden tools return the *same* error, so callers can't probe for tools they can't use.
-  Search and `get_tool_schema` only ever show tools the caller may call. The audit log records the real reason.
-* Upstream credentials (e.g. `Authorization: Bearer ${PAYMENTS_API_TOKEN}`) are expanded from the environment at
-  connect time. They are never stored in the registry DB or returned by any API, and agents never see them.
-* Read-only roles rely on MCP `readOnlyHint` annotations. REST bridges infer them (GET = read-only), and OpenAPI
-  operations can override with `x-mcp-read-only` / `x-mcp-destructive`, or opt out with `x-mcp-exclude`.
-* Runtime registration of `mcp_stdio` servers is off by default, because it would mean running an arbitrary
-  command on the gateway host. URLs must be http(s), and `upstream_host_allowlist` limits SSRF.
-* Audit arguments are redacted by key (`card_number`, `token`, `password`…), truncated, and fingerprinted
-  (`args_sha256`). That lets you correlate calls with upstream logs without storing payloads.
-* Upstream 4xx responses come back to the agent as tool errors, because they are meaningful ("charge not found").
-  5xx responses, timeouts and connection failures count toward the circuit breaker.
+## Stack
 
-**Resilience.** Each MCP upstream has a supervisor task that owns the session, pings it, and reconnects with
-exponential backoff. A failed refresh keeps the last known-good catalog. Both MCP endpoints are stateless
-(Streamable HTTP, JSON responses), so replicas can sit behind any load balancer.
+Python 3.11+ · FastAPI · official MCP SDK (Streamable HTTP + stdio) · Pydantic · SQLite · React 19 + TypeScript + Vite ·
+nginx · Caddy · Docker Compose · Playwright · GitHub Actions · OpenRouter (any OpenAI-compatible LLM API)
 
-## Configuration
-
-See [`examples/gateway.yaml`](examples/gateway.yaml) for a fully commented example covering all five upstream kinds,
-roles, keys and limits. Endpoint URLs accept `${VAR:-default}`, and `MCPGW_CONFIG`, `MCPGW_HOST` and `MCPGW_PORT`
-override the basics. Validate a config with `python -m mcp_gateway check-config -c <file>`.
-
-## Testing
-
-Three layers:
-
-* `pytest -q`: **58 Python tests** (details below).
-* `npm run build` in `console/`: strict TypeScript typecheck plus production build.
-* `python console/e2e/ui_smoke.py --url http://localhost:3000`: drives the **real UI in a headless browser** against
-  the running Docker stack. It covers the playground flow, every operator page, all 6 scenarios (they must PASS),
-  registering and removing a server through the UI, and it fails on any browser console error, including CSP
-  violations. CI runs this against `docker compose` on every push.
-
-`pytest -q` runs **58 tests**:
-* **Unit tests:** policy, token buckets, auth, config, audit redaction, circuit breaker, search ranking, OpenAPI
-  conversion (refs, cycles, exclusions), result truncation, metrics.
-* **End-to-end tests:** real uvicorn servers for every upstream kind behind a real gateway, driven by the official MCP
-  client. They cover RBAC filtering in both discovery modes, the search→schema→call flow, the existence-oracle check,
-  read-only roles, schema validation, stdio upstreams, credential injection, per-tool rate limits (MCP and HTTP 429),
-  runtime register/replace/disable/deregister with persistence, admin guards, circuit breaking on a dead upstream,
-  the audit trail, metrics (including bounded label cardinality), the stats/policy-matrix APIs, and 40 concurrent
-  mixed-principal calls.
-
-## What production would add next
-
-The Docker stack is a complete single-machine deployment. Running **several gateway replicas** is the next step,
-and these are the parts that are deliberately single-node today:
-
-* **Shared state for multiple replicas.** Rate limits are in-memory (the `RateLimiter` protocol is the seam for Redis).
-  The registry uses SQLite (swap in Postgres). The audit sink should go to Kafka or a log pipeline.
-* **Identity.** Use OIDC/JWT and mTLS for service callers, and do per-user OAuth token exchange to upstreams instead
-  of one shared upstream credential.
-* **Search.** Use a hybrid lexical + embedding ranker, learned from usage logs (which searches led to which calls).
-* **Governance.** Add an approval workflow for new servers, schema-change diffing, tool-description linting, and
-  per-tool owners and SLOs.
-* **Observability.** OpenTelemetry traces across gateway and upstreams. Today a request ID is propagated and
-  Prometheus metrics are exported.
-
-## Project layout
+## Repository
 
 ```
-mcp_gateway/        gateway package (≈2.7k LOC)
-  app.py            ASGI app, auth middleware, REST + admin APIs
-  core.py           call pipeline and discovery
-  mcp_server.py     /mcp (incremental) and /mcp/full endpoints
-  registry.py       registry, catalog, circuit breaker
-  search.py         BM25F tool search
-  upstreams/        MCP (HTTP/stdio), REST, OpenAPI, in-process
-console/            React + TypeScript web console (Vite), nginx config, Playwright e2e
-examples/           mock backends (20 tools), gateway.yaml, client demo
-experiments/        token-usage experiment + results
-tests/              unit and end-to-end tests
-docs/screenshots/   generated by the UI e2e run
-docker-compose.yml  backends + gateway + console on one machine
+mcp_gateway/   gateway (registry, core pipeline, MCP endpoints, search, policy, agent, upstream bridges)
+console/       React console, nginx config, Playwright e2e + demo recorder
+examples/      5 mock backends (20 tools) and the example config
+experiments/   token-usage experiment and results
+deploy/        public-demo overlay, production compose (Caddy/HTTPS), env template
+docs/          architecture & reference, deployment guide, screenshots
+tests/         unit and end-to-end tests
 ```
 
-MIT licensed. Not affiliated with Uber; the backends are mocks.
+Local development without Docker, endpoint reference, security model and configuration:
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## License
+
+[MIT](LICENSE). Inspired by Uber's engineering blog; not affiliated with Uber. All backends are mocks.

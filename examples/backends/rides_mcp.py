@@ -73,4 +73,9 @@ def list_ride_history(rider_id: str, limit: int = 10) -> dict:
     return {"rider_id": rider_id, "trips": trips}
 
 
+def reset() -> None:
+    """Clear in-memory state (public demo resets)."""
+    _rides.clear()
+
+
 app = mcp.streamable_http_app()

@@ -1,0 +1,40 @@
+# Production override for a public demo on a single VM, with automatic HTTPS.
+#
+#   cp deploy/.env.example .env      # set DOMAIN and OPENROUTER_API_KEY
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build --wait
+#
+# Only Caddy is reachable from the internet (80/443). The console, gateway and backends stay
+# on the private Docker network; agents reach MCP at https://$DOMAIN/mcp through the proxy.
+services:
+  backends:
+    environment:
+      DEMO_RESET_S: "1800"            # wipe mock backend data every 30 min
+
+  gateway:
+    command: ["serve", "--config", "examples/gateway.yaml", "--config", "deploy/demo.overlay.yaml"]
+    ports: !reset []                  # not published: only reachable via console → nginx
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in .env}
+      PAYMENTS_API_TOKEN: ${PAYMENTS_API_TOKEN:?set PAYMENTS_API_TOKEN in .env}
+    volumes:
+      - ./deploy/demo.overlay.yaml:/app/deploy/demo.overlay.yaml:ro
+
+  console:
+    ports: !reset []
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      console: { condition: service_healthy }
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

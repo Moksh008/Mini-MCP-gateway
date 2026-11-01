@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { DEMO_IDENTITIES, http } from "./api";
 import { Dot } from "./components/ui";
 import { usePoll, useSessionState, useWire } from "./hooks";
+import { AgentPage } from "./pages/Agent";
 import { Audit } from "./pages/Audit";
 import { Catalog } from "./pages/Catalog";
 import { Experiment } from "./pages/Experiment";
@@ -15,6 +16,7 @@ const BACKEND_HOST = import.meta.env.VITE_BACKEND_HOST ?? "127.0.0.1";
 
 const NAV = [
   { id: "overview", label: "Overview", icon: "◎", admin: true },
+  { id: "agent", label: "AI Agent", icon: "✦", admin: false },
   { id: "playground", label: "Agent Playground", icon: "▶", admin: false },
   { id: "scenarios", label: "Scenarios", icon: "✓", admin: false },
   { id: "registry", label: "Registry", icon: "▤", admin: true },
@@ -37,6 +39,7 @@ export function App() {
   const wire = useWire();
   const traffic = useTraffic(adminKey);
   const health = usePoll(() => http(null, "/readyz"), 5000);
+  const meta = usePoll(() => http(null, "/v1/meta"), 30000);
 
   useEffect(() => {
     const onHash = () => setPage(currentPage());
@@ -76,9 +79,16 @@ export function App() {
       </aside>
 
       <main className="main">
+        {meta.data?.public_demo && (
+          <div className="demo-banner">
+            <b>Public sandbox.</b> Demo API keys are published on purpose, runtime changes expire, and all data resets every{" "}
+            {Math.round(meta.data.demo.reset_interval_s / 60)} minutes. Please be kind to it.
+          </div>
+        )}
         {needsKey ? <SignIn onSignIn={setAdminKey} /> : (
           <>
             {page === "overview" && <Overview adminKey={adminKey!} traffic={traffic} onNavigate={navigate} />}
+            {page === "agent" && <AgentPage info={meta.data?.agent ?? null} />}
             {page === "playground" && <Playground wire={wire} />}
             {page === "scenarios" && <Scenarios />}
             {page === "registry" && <Registry adminKey={adminKey!} backendHost={BACKEND_HOST} />}

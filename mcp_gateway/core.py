@@ -63,8 +63,14 @@ class Gateway:
             self._index_version = self.registry.version
         return self._index
 
-    def check_request_rate(self, principal: Principal) -> None:
-        wait = self.limiter.acquire(f"req:{principal.id}", self.config.limits.default_request_rate)
+    def rate_key(self, principal: Principal, client_ip: str | None) -> str:
+        """Rate-limit identity: the principal, plus the client IP when credentials are shared."""
+        if self.config.limits.per_client_ip and client_ip:
+            return f"{principal.id}@{client_ip}"
+        return principal.id
+
+    def check_request_rate(self, principal: Principal, client_ip: str | None = None) -> None:
+        wait = self.limiter.acquire(f"req:{self.rate_key(principal, client_ip)}", self.config.limits.default_request_rate)
         if wait > 0:
             self.metrics.rate_limited.inc("request")
             raise RateLimited(f"request rate limit exceeded; retry after {wait:.1f}s", retry_after=wait)
@@ -154,7 +160,7 @@ class Gateway:
         if not allowed:
             raise ToolNotFound(f"tool '{name}' not found or not permitted", detail=reason)
 
-        self._enforce_rate_limits(ctx.principal, tool)
+        self._enforce_rate_limits(ctx.principal, tool, ctx.client_ip)
         self._validate(tool, arguments)
 
         state = self.registry.get_server(tool.server)
@@ -190,15 +196,16 @@ class Gateway:
         self.metrics.circuit_open.set(tool.server, value=0.0)
         return self._bound_result(result)
 
-    def _enforce_rate_limits(self, principal: Principal, tool: ToolRecord) -> None:
+    def _enforce_rate_limits(self, principal: Principal, tool: ToolRecord, client_ip: str | None = None) -> None:
+        who = self.rate_key(principal, client_ip)
         spec = self.policy.principal_tool_rate(principal, self.config.limits.default_tool_call_rate)
-        wait = self.limiter.acquire(f"call:{principal.id}", spec)
+        wait = self.limiter.acquire(f"call:{who}", spec)
         if wait > 0:
             self.metrics.rate_limited.inc("principal")
             raise RateLimited(f"tool call rate limit exceeded; retry after {wait:.1f}s", retry_after=wait)
         tool_spec = self.policy.tool_specific_rate(principal, tool.qualified_name)
         if tool_spec:
-            wait = self.limiter.acquire(f"call:{principal.id}:{tool.qualified_name}", tool_spec)
+            wait = self.limiter.acquire(f"call:{who}:{tool.qualified_name}", tool_spec)
             if wait > 0:
                 self.metrics.rate_limited.inc("tool")
                 raise RateLimited(

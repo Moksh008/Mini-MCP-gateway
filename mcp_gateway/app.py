@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import re
 import uuid
 from typing import Any
-from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from pydantic import BaseModel, Field
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
+from .agent import Agent
 from .audit import AuditLogger
 from .auth import Authenticator
 from .config import GatewayConfig
@@ -25,6 +27,7 @@ from .errors import AuthenticationError, ConfigError, GatewayError, RateLimited
 from .mcp_server import build_mcp_server
 from .metrics import Metrics
 from .models import CallContext, Principal, ServerSpec
+from .netguard import UnsafeUpstream, check_upstream_url
 from .policy import PolicyEngine
 from .ratelimit import InMemoryRateLimiter
 from .registry import Registry
@@ -32,7 +35,7 @@ from .store import RegistryStore
 from .upstreams import Upstream
 
 log = logging.getLogger(__name__)
-PUBLIC_PATHS = {"/healthz", "/readyz"}
+PUBLIC_PATHS = {"/healthz", "/readyz", "/v1/meta"}
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -78,7 +81,7 @@ class AuthMiddleware:
                              [(b"www-authenticate", b'Bearer realm="mini-mcp-gateway"')])
             return
         try:
-            gateway.check_request_rate(principal)
+            gateway.check_request_rate(principal, client[0] if client else None)
         except RateLimited as e:
             gateway.audit.log("request.rate_limited", request_id=request_id, principal=principal.id,
                               outcome="rate_limited", path=scope["path"])
@@ -139,9 +142,48 @@ def make_ctx(request: Request, principal: Principal, transport: str = "rest") ->
 # ---------------------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------------------
-def rest_router() -> APIRouter:
+class AgentRunRequest(BaseModel):
+    task: str = Field(min_length=3, max_length=1000)
+    mode: str = Field(default="search", pattern="^(search|full)$")
+    model: str | None = None
+
+
+def rest_router(config: GatewayConfig) -> APIRouter:
     """Plain HTTP access for non-MCP clients (same auth, policy, limits and audit)."""
     r = APIRouter(prefix="/v1", tags=["tools"])
+
+    @r.get("/meta")
+    async def meta(request: Request):
+        """Public: what this deployment is and what it allows (drives the console's banners)."""
+        demo = config.demo
+        agent = getattr(request.app.state, "agent", None)
+        return {
+            "version": __version__,
+            "public_demo": demo.enabled,
+            "demo": {"reset_interval_s": demo.reset_interval_s, "runtime_server_ttl_s": demo.runtime_server_ttl_s,
+                     "max_runtime_servers": demo.max_runtime_servers} if demo.enabled else None,
+            "agent": agent.info() if agent else {"available": False},
+        }
+
+    @r.post("/agent/run")
+    async def agent_run(body: AgentRunRequest, request: Request, principal: Principal = Depends(get_principal)):
+        """Run the LLM agent as the calling principal. Streams Server-Sent Events."""
+        agent: Agent = request.app.state.agent
+        ctx = make_ctx(request, principal, transport="agent")
+        ctx.discovery_mode = body.mode
+        try:
+            model = agent.admit(ctx, body.model)
+        except GatewayError as e:
+            headers = {"Retry-After": str(max(1, int(e.retry_after + 0.999)))} if isinstance(e, RateLimited) else None
+            status = e.http_status if e.code != "internal_error" else 503
+            return JSONResponse({"error": e.code, "message": e.message}, status_code=status, headers=headers)
+
+        async def events():
+            async for event in agent.run(ctx, body.task, body.mode, model):
+                yield "data: " + json.dumps(event, default=str) + "\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @r.get("/whoami")
     async def whoami(principal: Principal = Depends(get_principal)):
@@ -186,18 +228,22 @@ def admin_router(config: GatewayConfig) -> APIRouter:
         gw.audit.log(f"admin.{action}", request_id=getattr(request.state, "request_id", None),
                      principal=principal.id, outcome="ok", **fields)
 
-    def check_spec_allowed(spec: ServerSpec) -> None:
+    async def check_spec_allowed(spec: ServerSpec, gw: Gateway, replace: bool) -> None:
         if spec.kind == "mcp_stdio" and not config.allow_stdio_registration:
             raise HTTPException(403, "registering mcp_stdio servers via the API is disabled "
                                      "(set allow_stdio_registration: true to enable)")
-        if config.upstream_host_allowlist:
-            for url in filter(None, [spec.url, spec.openapi_url]):
-                host = urlparse(url).hostname or ""
-                if host not in config.upstream_host_allowlist:
-                    raise HTTPException(403, f"upstream host '{host}' is not in upstream_host_allowlist")
         for url in filter(None, [spec.url, spec.openapi_url]):
-            if urlparse(url).scheme not in ("http", "https"):
-                raise HTTPException(422, "upstream URLs must be http(s)")
+            try:
+                await check_upstream_url(url, config.upstream_host_allowlist)
+            except UnsafeUpstream as e:
+                status = 422 if "http(s)" in str(e) else 403
+                raise HTTPException(status, str(e)) from None
+        if config.demo.enabled:
+            runtime = gw.registry.runtime_servers()
+            replacing = replace and any(s.spec.name == spec.name for s in runtime)
+            if not replacing and len(runtime) >= config.demo.max_runtime_servers:
+                raise HTTPException(429, f"public demo: at most {config.demo.max_runtime_servers} runtime servers "
+                                         f"at a time (they expire after {config.demo.runtime_server_ttl_s:.0f}s)")
 
     @r.get("/servers")
     async def list_servers(_: Principal = Depends(require_admin), gw: Gateway = Depends(get_gateway)):
@@ -213,7 +259,7 @@ def admin_router(config: GatewayConfig) -> APIRouter:
     @r.post("/servers", status_code=201)
     async def register(spec: ServerSpec, request: Request, replace: bool = False,
                        principal: Principal = Depends(require_admin), gw: Gateway = Depends(get_gateway)):
-        check_spec_allowed(spec)
+        await check_spec_allowed(spec, gw, replace)
         try:
             state = await gw.registry.register(spec, actor=principal.id, replace=replace)
         except ConfigError as e:
@@ -296,9 +342,30 @@ def admin_router(config: GatewayConfig) -> APIRouter:
     async def audit(limit: int = Query(100, ge=1, le=2000), principal: str | None = None,
                     event: str | None = None, tool: str | None = None, outcome: str | None = None,
                     _: Principal = Depends(require_admin), gw: Gateway = Depends(get_gateway)):
-        return {"events": gw.audit.recent(limit, principal=principal, event=event, tool=tool, outcome=outcome)}
+        events = gw.audit.recent(limit, principal=principal, event=event, tool=tool, outcome=outcome)
+        if config.demo.enabled and config.demo.hide_client_ips:
+            events = [{k: v for k, v in e.items() if k != "client_ip"} for e in events]
+        return {"events": events}
 
     return r
+
+
+async def _demo_janitor(config: GatewayConfig, gw: Gateway) -> None:
+    """Public demo housekeeping: expire runtime servers and periodically reset the registry."""
+    loop = asyncio.get_running_loop()
+    next_reset = loop.time() + config.demo.reset_interval_s
+    while True:
+        await asyncio.sleep(15)
+        try:
+            expired = await gw.registry.expire_runtime_servers(config.demo.runtime_server_ttl_s, actor="demo-janitor")
+            if expired:
+                gw.audit.log("admin.server.expire", principal="demo-janitor", outcome="ok", servers=expired)
+            if loop.time() >= next_reset:
+                next_reset = loop.time() + config.demo.reset_interval_s
+                removed = await gw.registry.reset_to_config(actor="demo-janitor")
+                gw.audit.log("admin.demo.reset", principal="demo-janitor", outcome="ok", removed=removed or None)
+        except Exception:  # noqa: BLE001 - housekeeping must never die
+            log.exception("demo janitor iteration failed")
 
 
 # ---------------------------------------------------------------------------------------
@@ -318,6 +385,7 @@ def create_app(config: GatewayConfig, *, embedded_upstreams: list[Upstream] | No
                           limiter=InMemoryRateLimiter(), audit=audit, metrics=metrics)
         holder["gw"] = gateway
         app.state.gateway = gateway
+        app.state.agent = Agent(config.agent, gateway)
         managers = {
             mode: StreamableHTTPSessionManager(app=build_mcp_server(gateway, mode), stateless=True, json_response=True)
             for mode in ("search", "full")
@@ -331,12 +399,17 @@ def create_app(config: GatewayConfig, *, embedded_upstreams: list[Upstream] | No
             for up in embedded_upstreams or []:
                 await registry.register_upstream(up)
             registry.start_background_refresh(config.refresh_interval_s)
+            janitor = asyncio.create_task(_demo_janitor(config, gateway)) if config.demo.enabled else None
             app.state.ready = True
             log.info("gateway ready: %d servers, %d tools", len(registry.servers()), len(registry.tools()))
             try:
                 yield
             finally:
                 app.state.ready = False
+                if janitor:
+                    janitor.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await janitor
                 await registry.close()
                 audit.close()
                 store.close()
@@ -349,7 +422,7 @@ def create_app(config: GatewayConfig, *, embedded_upstreams: list[Upstream] | No
     methods = ["GET", "POST", "DELETE"]
     app.router.routes.append(Route("/mcp", endpoint=app.state.mcp_endpoints["search"], methods=methods))
     app.router.routes.append(Route("/mcp/full", endpoint=app.state.mcp_endpoints["full"], methods=methods))
-    app.include_router(rest_router())
+    app.include_router(rest_router(config))
     app.include_router(admin_router(config))
 
     @app.get("/healthz", include_in_schema=False)
