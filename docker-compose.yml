@@ -1,0 +1,60 @@
+# The whole stack on a single machine:
+#
+#   docker compose up --build -d
+#   open http://localhost:3000            ← web console
+#   http://localhost:8787/mcp             ← MCP endpoint for agents (Claude Code, etc.)
+#
+# backends  4 mock HTTP services (rides, support MCP; payments OpenAPI; maps REST)
+# gateway   the MCP gateway (also spawns the stdio "eats" MCP server inside its container)
+# console   nginx serving the React console and reverse-proxying the gateway (same origin)
+name: mini-mcp-gateway
+
+services:
+  backends:
+    build: .
+    image: mini-mcp-gateway:latest
+    entrypoint: ["python", "-m", "examples.run_backends"]
+    command: []
+    environment:
+      BACKENDS_HOST: 0.0.0.0
+      PAYMENTS_API_TOKEN: ${PAYMENTS_API_TOKEN:-dev-payments-token}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9104/openapi.json')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  gateway:
+    image: mini-mcp-gateway:latest
+    depends_on:
+      backends: { condition: service_healthy }
+    ports: ["8787:8787"]
+    environment:
+      RIDES_URL: http://backends:9101/mcp
+      SUPPORT_URL: http://backends:9103/mcp
+      PAYMENTS_URL: http://backends:9104
+      MAPS_URL: http://backends:9105
+      PAYMENTS_API_TOKEN: ${PAYMENTS_API_TOKEN:-dev-payments-token}
+      FORWARDED_ALLOW_IPS: "*"        # trust X-Forwarded-For from the console proxy (private network)
+    volumes:
+      - gateway-var:/app/var          # registry.db + audit.jsonl survive restarts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  console:
+    build:
+      context: .
+      dockerfile: console/Dockerfile
+    image: mini-mcp-gateway-console:latest
+    depends_on:
+      gateway: { condition: service_healthy }
+    ports: ["3000:8080"]
+    restart: unless-stopped
+
+volumes:
+  gateway-var:

@@ -1,0 +1,154 @@
+{
+  "live": {
+    "tool_count": 20,
+    "full_definitions_tokens": 1740,
+    "meta_definitions_tokens": 225,
+    "avg_tokens_per_tool": 87.0,
+    "largest_tools": [
+      [
+        "rides__request_ride",
+        177
+      ],
+      [
+        "rides__estimate_fare",
+        151
+      ],
+      [
+        "payments__charge_payment",
+        121
+      ],
+      [
+        "maps__get_route",
+        110
+      ],
+      [
+        "support__create_ticket",
+        110
+      ]
+    ],
+    "tasks": [
+      {
+        "task": "Estimate fare Market St \u2192 SFO",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 2281,
+        "discovery_tokens": 532,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Book a comfort ride",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 2356,
+        "discovery_tokens": 564,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Cancel my current ride",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 2134,
+        "discovery_tokens": 454,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Where is my food order?",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 1966,
+        "discovery_tokens": 387,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Order sushi for dinner",
+        "tools_needed": 3,
+        "full_total": 6960,
+        "incr_total": 8959,
+        "discovery_tokens": 1171,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Refund the last charge",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 2082,
+        "discovery_tokens": 452,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Send me my receipt",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 1823,
+        "discovery_tokens": 347,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "How long to drive to Ferry Building?",
+        "tools_needed": 2,
+        "full_total": 5220,
+        "incr_total": 5551,
+        "discovery_tokens": 968,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Complain about my driver",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 1806,
+        "discovery_tokens": 355,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      },
+      {
+        "task": "Show my past trips",
+        "tools_needed": 1,
+        "full_total": 3480,
+        "incr_total": 2070,
+        "discovery_tokens": 431,
+        "recall_at_1": 1.0,
+        "recall_at_5": 1.0
+      }
+    ]
+  },
+  "scale": [
+    {
+      "catalog_size": 20,
+      "full_definitions_tokens": 1740,
+      "recall_at_1": 1.0,
+      "recall_at_5": 1.0
+    },
+    {
+      "catalog_size": 100,
+      "full_definitions_tokens": 13762,
+      "recall_at_1": 0.923,
+      "recall_at_5": 1.0
+    },
+    {
+      "catalog_size": 500,
+      "full_definitions_tokens": 73865,
+      "recall_at_1": 0.923,
+      "recall_at_5": 1.0
+    },
+    {
+      "catalog_size": 1000,
+      "full_definitions_tokens": 148890,
+      "recall_at_1": 0.923,
+      "recall_at_5": 1.0
+    },
+    {
+      "catalog_size": 5000,
+      "full_definitions_tokens": 749596,
+      "recall_at_1": 0.923,
+      "recall_at_5": 1.0
+    }
+  ]
+}

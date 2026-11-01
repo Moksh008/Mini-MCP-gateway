@@ -1,0 +1,13 @@
+.git
+**/__pycache__
+.pytest_cache
+.ruff_cache
+var
+var_*.log
+*.db
+*.jsonl
+.venv-lint
+console/node_modules
+console/dist
+console/e2e
+docs

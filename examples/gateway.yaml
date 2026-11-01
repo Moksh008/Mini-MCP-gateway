@@ -1,0 +1,139 @@
+# Mini MCP Gateway — example configuration.
+#
+# 5 upstreams / 20 tools spanning every supported integration style:
+#   rides    native MCP server over Streamable HTTP
+#   support  native MCP server over Streamable HTTP
+#   eats     native MCP server over stdio (spawned and supervised by the gateway)
+#   payments existing REST service, bridged automatically from its OpenAPI document
+#   maps     legacy REST service with no spec, bridged from declared operations
+#
+# The API keys below are DEMO KEYS ONLY (plaintext = demo-<role>-key). Generate real keys with
+# `python -m mcp_gateway gen-key`; only the SHA-256 digest goes into config.
+
+host: 127.0.0.1
+port: 8787
+registry_db: ../var/registry.db
+refresh_interval_s: 300
+allow_stdio_registration: false
+upstream_host_allowlist: []   # e.g. [rides.internal, payments.internal]
+
+audit:
+  path: ../var/audit.jsonl
+
+limits:
+  default_request_rate: { per_minute: 600, burst: 100 }
+  default_tool_call_rate: { per_minute: 120, burst: 30 }
+  max_result_bytes: 262144
+  max_argument_bytes: 65536
+
+circuit_breaker:
+  failure_threshold: 5
+  reset_after_s: 30
+
+servers:
+  - name: rides
+    kind: mcp_http
+    url: ${RIDES_URL:-http://127.0.0.1:9101/mcp}
+    description: Ride booking, fare estimates and trip history
+    owner: rides-platform
+    tags: [mobility, rides]
+
+  - name: support
+    kind: mcp_http
+    url: ${SUPPORT_URL:-http://127.0.0.1:9103/mcp}
+    description: Customer support tickets
+    owner: customer-care
+    tags: [support]
+
+  - name: eats
+    kind: mcp_stdio
+    command: python            # resolved to the gateway's own interpreter
+    args: [-m, examples.backends.eats_mcp]
+    cwd: ..
+    description: Restaurant search and food delivery orders
+    owner: delivery
+    tags: [delivery, food]
+
+  - name: payments
+    kind: openapi
+    url: ${PAYMENTS_URL:-http://127.0.0.1:9104}
+    headers:
+      # Upstream credential is injected by the gateway; agents never see it.
+      Authorization: "Bearer ${PAYMENTS_API_TOKEN:-dev-payments-token}"
+    description: Payment methods, charges, refunds and invoices
+    owner: payments
+    tags: [payments, money]
+    timeout_s: 10
+
+  - name: maps
+    kind: rest
+    url: ${MAPS_URL:-http://127.0.0.1:9105}
+    description: Geocoding, routing and ETAs
+    owner: maps
+    tags: [maps, geo]
+    operations:
+      - name: geocode
+        method: GET
+        path: /v1/geocode
+        description: Convert a street address or place name into latitude/longitude coordinates.
+        params:
+          - { name: address, location: query, required: true, description: Address or place name }
+      - name: reverse_geocode
+        method: GET
+        path: /v1/reverse-geocode
+        description: Convert latitude/longitude coordinates into the nearest street address.
+        params:
+          - { name: lat, location: query, required: true, schema: { type: number } }
+          - { name: lng, location: query, required: true, schema: { type: number } }
+      - name: get_eta
+        method: POST
+        path: /v1/eta
+        read_only: true
+        description: Estimate travel time (ETA) and distance between two coordinates.
+        body_schema: &route_body
+          type: object
+          properties:
+            origin_lat: { type: number }
+            origin_lng: { type: number }
+            dest_lat: { type: number }
+            dest_lng: { type: number }
+            mode: { type: string, enum: [driving, walking, cycling], default: driving }
+          required: [origin_lat, origin_lng, dest_lat, dest_lng]
+      - name: get_route
+        method: POST
+        path: /v1/route
+        read_only: true
+        description: Get turn-by-turn driving directions (route) between two coordinates.
+        body_schema: *route_body
+
+roles:
+  admin:
+    description: Platform operators
+    admin: true
+
+  rider-agent:
+    description: Consumer-facing assistant acting for a rider
+    allow: ["rides__*", "maps__*", "eats__*", "payments__list_payment_methods",
+            "payments__charge_payment", "payments__get_invoice", "support__create_ticket",
+            "support__get_ticket"]
+    deny: ["payments__refund_payment"]
+    rate_limit: { per_minute: 120, burst: 30 }
+    tool_rate_limits:
+      payments__charge_payment: { per_minute: 5, burst: 2 }
+
+  support-agent:
+    description: Internal customer-care copilot
+    allow: ["support__*", "payments__*", "rides__get_ride_status", "rides__list_ride_history",
+            "eats__track_order"]
+    rate_limit: { per_minute: 300, burst: 60 }
+
+  analyst:
+    description: Read-only access to everything
+    allow: ["*"]
+    allow_writes: false
+
+api_keys:
+  - { id: ops-admin,    roles: [admin],         key_sha256: ac5bb3526d3be432ba19fb1fc0712d350c160bd2169cd24401c9fcaeaac2d860 }
+  - { id: rider-bot,    roles: [rider-agent],   key_sha256: 7263a8ba62987a12c75b56e502a11bacfdbb9ca712554ba505ac9404ebb856dd }
+  - { id: care-copilot, roles: [support-agent], key_sha256: a9e99ff0e3a6317a4c201ed8e7f5dff708661b4f565315a7b6800f9d8d091d0c }
+  - { id: bi-analyst,   roles: [analyst],       key_sha256: ba041bbd3d5f84055d10645d916eeace5ad28692224918c320e627f95bccbd3b }
